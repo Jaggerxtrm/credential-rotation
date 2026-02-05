@@ -216,12 +216,14 @@ class AccountManager:
 
     def _atomic_symlink_update(self, target: Path) -> None:
         """
-        Atomically update the oauth_creds.json symlink.
+        Atomically update the oauth_creds.json symlink using a RELATIVE path.
 
-        Uses os.replace() which is atomic on POSIX systems.
+        Using relative paths ensures the symlink remains valid whether accessed
+        from inside a container (mounted at /root/.qwen) or the host
+        (at /home/user/.qwen).
 
         Args:
-            target: Path to target credential file.
+            target: Absolute path to target credential file.
         """
         temp_link = self.creds_link.with_suffix(".json.tmp")
 
@@ -230,8 +232,12 @@ class AccountManager:
             if temp_link.exists():
                 temp_link.unlink()
 
-            # Create temporary symlink
-            temp_link.symlink_to(target)
+            # Calculate relative path: e.g., "accounts/oauth_creds_1.json"
+            # relative_to throws if not in same tree, so we use os.path.relpath for safety
+            relative_target = os.path.relpath(target, self.creds_link.parent)
+            
+            # Create temporary symlink pointing to RELATIVE path
+            temp_link.symlink_to(relative_target)
 
             # Atomic replace
             os.replace(temp_link, self.creds_link)
