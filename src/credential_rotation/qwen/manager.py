@@ -11,6 +11,7 @@ import fcntl
 import json
 import logging
 import os
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -26,7 +27,7 @@ DEFAULT_TOTAL_ACCOUNTS: Final[int] = 5
 DEFAULT_QWEN_DIR: Final[Path] = Path.home() / ".qwen"
 DEFAULT_LOCK_FILE: Final[str] = "/tmp/qwen_rotation.lock"
 ACCOUNTS_DIR_NAME: Final[str] = "accounts"
-OAUTH_CREDS_LINK: Final[str] = "oauth_creds.json"
+OAUTH_CREDS_FILE: Final[str] = "oauth_creds.json"
 STATE_FILE: Final[str] = "state.yaml"
 ROTATION_LOG: Final[str] = "rotation.log"
 
@@ -107,11 +108,11 @@ class AccountNotFoundError(Exception):
 
 class AccountManager:
     """
-    Manages Qwen account rotation with atomic operations.
+    Manages Qwen account rotation with physical file swapping.
 
     This class provides thread-safe account switching using:
     - File locking (flock) to prevent race conditions
-    - Atomic symlink updates via os.replace()
+    - Physical file copy (sync-back) to survive Qwen CLI overwrites
     - Persistent state tracking in state.yaml
     - Audit logging to rotation.log
     """
@@ -123,26 +124,17 @@ class AccountManager:
     ) -> None:
         """
         Initialize the AccountManager.
-
-        Args:
-            qwen_dir: Path to .qwen directory. Defaults to ~/.qwen
-            total_accounts: (Deprecated/Legacy) Default total number of accounts.
         """
         self.qwen_dir = qwen_dir or DEFAULT_QWEN_DIR
         self.total_accounts = total_accounts
         self.state_file = self.qwen_dir / STATE_FILE
         self.lock_file = Path(DEFAULT_LOCK_FILE)
         self.accounts_dir = self.qwen_dir / ACCOUNTS_DIR_NAME
-        self.creds_link = self.qwen_dir / OAUTH_CREDS_LINK
+        self.creds_file = self.qwen_dir / OAUTH_CREDS_FILE
         self.log_file = self.qwen_dir / ROTATION_LOG
 
     def get_state(self) -> RotationState:
-        """
-        Read current rotation state.
-
-        Returns:
-            Current RotationState, or default if state file doesn't exist.
-        """
+        """Read current rotation state."""
         if not self.state_file.exists():
             return RotationState(total_accounts=self.total_accounts)
 
@@ -155,14 +147,7 @@ class AccountManager:
             return RotationState(total_accounts=self.total_accounts)
 
     def _write_state(self, state: RotationState) -> None:
-        """
-        Write state file atomically.
-
-        Uses a temporary file and os.replace() for atomicity.
-
-        Args:
-            state: State to write.
-        """
+        """Write state file atomically."""
         temp_file = self.state_file.with_suffix(".tmp")
         try:
             if not self.qwen_dir.exists():
@@ -173,20 +158,16 @@ class AccountManager:
             os.replace(temp_file, self.state_file)
         except (IOError, OSError) as e:
             logger.error(f"Failed to write state file: {e}")
-            # Clean up temp file if it exists
-            if temp_file.exists():
-                temp_file.unlink()
+            if temp_file.exists(): temp_file.unlink()
             raise
 
     def _discover_account_ids(self) -> list[int]:
-        """Discover available account IDs from the accounts directory."""
+        """Discover available account IDs."""
         if not self.accounts_dir.exists():
             return []
-        
         ids = []
         for f in self.accounts_dir.glob("oauth_creds_*.json"):
             try:
-                # Extract number from oauth_creds_N.json
                 parts = f.stem.split("_")
                 if len(parts) >= 3:
                     ids.append(int(parts[-1]))
@@ -194,251 +175,125 @@ class AccountManager:
                 continue
         return sorted(ids)
 
-    def _validate_account_exists(self, index: int) -> Path:
+    def _swap_credentials(self, target_index: int, current_index: int | None = None) -> None:
         """
-        Validate that account credential file exists.
-
-        Args:
-            index: Account index (1-based).
-
-        Returns:
-            Path to the credential file.
-
-        Raises:
-            AccountNotFoundError: If credential file doesn't exist.
+        Physically swap credentials. 
+        Saves current file back to its slot (sync-back) and loads the new one.
         """
-        creds_file = self.accounts_dir / f"oauth_creds_{index}.json"
-        if not creds_file.exists():
-            raise AccountNotFoundError(
-                f"Account {index} credentials not found: {creds_file}"
-            )
-        return creds_file
+        # 1. Sync-back: Save current active file to its slot
+        if current_index is not None and self.creds_file.exists():
+            # Don't sync if it's a symlink (cleanup legacy)
+            if not self.creds_file.is_symlink():
+                current_slot = self.accounts_dir / f"oauth_creds_{current_index}.json"
+                try:
+                    shutil.copy2(self.creds_file, current_slot)
+                    logger.debug(f"Synced credentials back to account{current_index}")
+                except Exception as e:
+                    logger.error(f"Failed to sync-back credentials: {e}")
+            else:
+                # Remove legacy symlink to allow physical copy
+                self.creds_file.unlink()
 
-    def _atomic_symlink_update(self, target: Path) -> None:
-        """
-        Atomically update the oauth_creds.json symlink using a RELATIVE path.
+        # 2. Activate: Copy target account to main slot
+        target_slot = self.accounts_dir / f"oauth_creds_{target_index}.json"
+        if not target_slot.exists():
+            raise AccountNotFoundError(f"Account {target_index} source file not found")
 
-        Using relative paths ensures the symlink remains valid whether accessed
-        from inside a container (mounted at /root/.qwen) or the host
-        (at /home/user/.qwen).
-
-        Args:
-            target: Absolute path to target credential file.
-        """
-        temp_link = self.creds_link.with_suffix(".json.tmp")
-
+        temp_active = self.creds_file.with_suffix(".json.tmp")
         try:
-            # Remove temp link if it exists
-            if temp_link.exists():
-                temp_link.unlink()
+            shutil.copy2(target_slot, temp_active)
+            os.replace(temp_active, self.creds_file)
+            logger.debug(f"Activated account{target_index}")
+        except Exception as e:
+            if temp_active.exists(): temp_active.unlink()
+            raise OSError(f"Failed to activate credentials: {e}")
 
-            # Calculate relative path: e.g., "accounts/oauth_creds_1.json"
-            # relative_to throws if not in same tree, so we use os.path.relpath for safety
-            relative_target = os.path.relpath(target, self.creds_link.parent)
-            
-            # Create temporary symlink pointing to RELATIVE path
-            temp_link.symlink_to(relative_target)
-
-            # Atomic replace
-            os.replace(temp_link, self.creds_link)
-
-        except OSError as e:
-            logger.error(f"Failed to update symlink: {e}")
-            # Clean up temp file if it exists
-            if temp_link.exists():
-                temp_link.unlink()
-            raise
-
-    def _update_account_stats(
-        self,
-        state: RotationState,
-        account_index: int,
-    ) -> None:
-        """
-        Update statistics for an account after switch.
-
-        Args:
-            state: State to update.
-            account_index: Index of account being switched to.
-        """
-        account_key = f"account{account_index}"
+    def _update_account_stats(self, state: RotationState, index: int) -> None:
+        account_key = f"account{index}"
         if account_key not in state.accounts:
             state.accounts[account_key] = AccountStats()
-
         stats = state.accounts[account_key]
         stats.switches_count += 1
         stats.last_used = datetime.now().isoformat()
 
-    def _log_switch(
-        self,
-        from_index: int,
-        to_index: int,
-        reason: SwitchReason,
-    ) -> None:
-        """
-        Log switch event to rotation.log.
-
-        Args:
-            from_index: Previous account index.
-            to_index: New account index.
-            reason: Reason for the switch.
-        """
+    def _log_switch(self, from_idx: int, to_idx: int, reason: SwitchReason) -> None:
         log_entry = {
             "timestamp": datetime.now().isoformat(),
             "level": "INFO",
             "event": "account_switch",
-            "from": from_index,
-            "to": to_index,
+            "from": from_idx,
+            "to": to_idx,
             "reason": reason.value,
-            "trigger": "auto" if reason == SwitchReason.AUTO_QUOTA else "manual",
         }
-
         try:
             with open(self.log_file, "a") as f:
                 f.write(json.dumps(log_entry) + "\n")
-        except IOError as e:
-            logger.error(f"Failed to write to rotation log: {e}")
+        except IOError:
+            pass
 
     def _with_lock(self, func) -> Any:
-        """
-        Execute function with file lock held.
-
-        Args:
-            func: Function to execute while holding lock.
-
-        Returns:
-            Function result.
-
-        Raises:
-            LockError: If lock acquisition fails.
-        """
         lock_fd = None
         try:
             lock_fd = open(self.lock_file, "w")
             fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
             return func()
         except (IOError, OSError) as e:
-            logger.error(f"Failed to acquire lock: {e}")
-            raise LockError(f"Could not acquire lock: {e}") from e
+            raise LockError(f"Could not acquire lock: {e}")
         finally:
             if lock_fd:
                 fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
                 lock_fd.close()
 
     def switch_to(self, index: int, reason: SwitchReason = SwitchReason.MANUAL) -> bool:
-        """
-        Switch to specific account by index.
-
-        Args:
-            index: Target account index (1-based).
-            reason: Reason for the switch.
-
-        Returns:
-            True if switch successful.
-
-        Raises:
-            AccountNotFoundError: If target account doesn't exist.
-            LockError: If lock acquisition fails.
-        """
         def _do_switch() -> bool:
             state = self.get_state()
             current_index = state.current_index
-
-            # Validate credentials exist
-            target_creds = self._validate_account_exists(index)
-
-            # Atomic symlink update
-            self._atomic_symlink_update(target_creds)
-
-            # Update state
+            self._swap_credentials(index, current_index)
             state.current_index = index
             state.last_switch = datetime.now().isoformat()
             state.switches_total += 1
             self._update_account_stats(state, index)
-
             self._write_state(state)
             self._log_switch(current_index, index, reason)
-
-            logger.info(f"Switched from account{current_index} to account{index}")
             return True
-
         return self._with_lock(_do_switch)
 
     def switch_next(self, reason: SwitchReason = SwitchReason.AUTO_QUOTA) -> tuple[bool, int]:
-        """
-        Switch to next account in round-robin fashion using dynamic discovery.
-
-        Args:
-            reason: Reason for the switch.
-
-        Returns:
-            (success, new_index) tuple.
-            - success: True if switched, False if all accounts exhausted (wrapped to start)
-            - new_index: The new account index
-        """
         def _do_switch() -> tuple[bool, int]:
             state = self.get_state()
             current_index = state.current_index
-
-            # Discover available IDs
             available_ids = self._discover_account_ids()
             if not available_ids:
-                raise AccountNotFoundError("No accounts found in accounts directory")
+                raise AccountNotFoundError("No accounts found")
 
-            # Calculate next index based on available IDs
             try:
                 current_pos = available_ids.index(current_index)
                 next_pos = (current_pos + 1) % len(available_ids)
                 next_index = available_ids[next_pos]
-                # Wrapped if we go back to the first available ID (full cycle)
                 wrapped = next_pos == 0
             except ValueError:
-                # If current index is not in the list, just pick the first one
                 next_index = available_ids[0]
                 wrapped = True
 
-            if wrapped:
-                logger.warning(f"Account cycle wrapped back to account{next_index}")
-
-            # Validate credentials exist
-            target_creds = self._validate_account_exists(next_index)
-
-            # Atomic symlink update
-            self._atomic_symlink_update(target_creds)
-
-            # Update state
+            self._swap_credentials(next_index, current_index)
             state.current_index = next_index
             state.last_switch = datetime.now().isoformat()
             state.switches_total += 1
             self._update_account_stats(state, next_index)
-
-            # Update total_accounts in state for consistency
             state.total_accounts = len(available_ids)
-
             self._write_state(state)
             self._log_switch(current_index, next_index, reason)
-
-            logger.info(f"Switched from account{current_index} to account{next_index}")
             return (not wrapped, next_index)
-
         return self._with_lock(_do_switch)
 
     def list_accounts(self) -> dict[str, dict[str, Any]]:
-        """
-        List all configured accounts with status using dynamic discovery.
-
-        Returns:
-            Dictionary mapping account names to their status info.
-        """
         state = self.get_state()
         result = {}
         available_ids = self._discover_account_ids()
-
         for i in available_ids:
             account_key = f"account{i}"
             creds_file = self.accounts_dir / f"oauth_creds_{i}.json"
             stats = state.accounts.get(account_key, AccountStats())
-
             result[account_key] = {
                 "index": i,
                 "active": i == state.current_index,
@@ -446,30 +301,14 @@ class AccountManager:
                 "switches_count": stats.switches_count,
                 "last_used": stats.last_used,
             }
-
         return result
 
     def get_stats(self) -> dict[str, Any]:
-        """
-        Get usage statistics.
-
-        Returns:
-            Dictionary with usage statistics.
-        """
         state = self.get_state()
         accounts = self.list_accounts()
-
-        # Find most used account
-        most_used = max(
-            accounts.items(),
-            key=lambda x: x[1]["switches_count"],
-            default=("none", {"switches_count": 0})
-        )
-
+        most_used = max(accounts.items(), key=lambda x: x[1]["switches_count"], default=("none", {"switches_count": 0}))
         return {
-            "accounts": {
-                k: v["switches_count"] for k, v in accounts.items()
-            },
+            "accounts": {k: v["switches_count"] for k, v in accounts.items()},
             "total_switches": state.switches_total,
             "last_switch": state.last_switch,
             "current_account": f"account{state.current_index}",
@@ -478,13 +317,7 @@ class AccountManager:
         }
 
 
-def create_initial_state(
-    qwen_dir: Path | None = None,
-    total_accounts: int = DEFAULT_TOTAL_ACCOUNTS,
-) -> RotationState:
-    """
-    Create initial state file for a new setup.
-    """
+def create_initial_state(qwen_dir: Path | None = None, total_accounts: int = DEFAULT_TOTAL_ACCOUNTS) -> RotationState:
     manager = AccountManager(qwen_dir=qwen_dir, total_accounts=total_accounts)
     state = RotationState(total_accounts=total_accounts)
     manager._write_state(state)
