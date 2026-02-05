@@ -114,14 +114,6 @@ class AccountManager:
     - Atomic symlink updates via os.replace()
     - Persistent state tracking in state.yaml
     - Audit logging to rotation.log
-
-    Example:
-        >>> manager = AccountManager()
-        >>> manager.switch_next()
-        True
-        >>> state = manager.get_state()
-        >>> print(state.current_index)
-        2
     """
 
     def __init__(
@@ -134,7 +126,7 @@ class AccountManager:
 
         Args:
             qwen_dir: Path to .qwen directory. Defaults to ~/.qwen
-            total_accounts: Total number of configured accounts.
+            total_accounts: (Deprecated/Legacy) Default total number of accounts.
         """
         self.qwen_dir = qwen_dir or DEFAULT_QWEN_DIR
         self.total_accounts = total_accounts
@@ -173,6 +165,9 @@ class AccountManager:
         """
         temp_file = self.state_file.with_suffix(".tmp")
         try:
+            if not self.qwen_dir.exists():
+                self.qwen_dir.mkdir(parents=True, exist_ok=True)
+                
             with open(temp_file, "w") as f:
                 yaml.dump(state.to_dict(), f, default_flow_style=False)
             os.replace(temp_file, self.state_file)
@@ -182,6 +177,22 @@ class AccountManager:
             if temp_file.exists():
                 temp_file.unlink()
             raise
+
+    def _discover_account_ids(self) -> list[int]:
+        """Discover available account IDs from the accounts directory."""
+        if not self.accounts_dir.exists():
+            return []
+        
+        ids = []
+        for f in self.accounts_dir.glob("oauth_creds_*.json"):
+            try:
+                # Extract number from oauth_creds_N.json
+                parts = f.stem.split("_")
+                if len(parts) >= 3:
+                    ids.append(int(parts[-1]))
+            except (ValueError, IndexError):
+                continue
+        return sorted(ids)
 
     def _validate_account_exists(self, index: int) -> Path:
         """
@@ -327,10 +338,6 @@ class AccountManager:
             state = self.get_state()
             current_index = state.current_index
 
-            # Validate index
-            if index < 1 or index > state.total_accounts:
-                raise ValueError(f"Invalid account index: {index}")
-
             # Validate credentials exist
             target_creds = self._validate_account_exists(index)
 
@@ -353,28 +360,39 @@ class AccountManager:
 
     def switch_next(self, reason: SwitchReason = SwitchReason.AUTO_QUOTA) -> tuple[bool, int]:
         """
-        Switch to next account in round-robin fashion.
+        Switch to next account in round-robin fashion using dynamic discovery.
 
         Args:
             reason: Reason for the switch.
 
         Returns:
             (success, new_index) tuple.
-            - success: True if switched, False if all accounts exhausted (wrapped to 1)
+            - success: True if switched, False if all accounts exhausted (wrapped to start)
             - new_index: The new account index
         """
         def _do_switch() -> tuple[bool, int]:
             state = self.get_state()
             current_index = state.current_index
 
-            # Calculate next index (round-robin)
-            next_index = (current_index % state.total_accounts) + 1
+            # Discover available IDs
+            available_ids = self._discover_account_ids()
+            if not available_ids:
+                raise AccountNotFoundError("No accounts found in accounts directory")
 
-            # Check if we've completed a full cycle
-            wrapped = next_index == 1 and current_index == state.total_accounts
+            # Calculate next index based on available IDs
+            try:
+                current_pos = available_ids.index(current_index)
+                next_pos = (current_pos + 1) % len(available_ids)
+                next_index = available_ids[next_pos]
+                # Wrapped if we go back to the first available ID (full cycle)
+                wrapped = next_pos == 0
+            except ValueError:
+                # If current index is not in the list, just pick the first one
+                next_index = available_ids[0]
+                wrapped = True
 
             if wrapped:
-                logger.warning("All accounts exhausted, cycling back to account1")
+                logger.warning(f"Account cycle wrapped back to account{next_index}")
 
             # Validate credentials exist
             target_creds = self._validate_account_exists(next_index)
@@ -388,6 +406,9 @@ class AccountManager:
             state.switches_total += 1
             self._update_account_stats(state, next_index)
 
+            # Update total_accounts in state for consistency
+            state.total_accounts = len(available_ids)
+
             self._write_state(state)
             self._log_switch(current_index, next_index, reason)
 
@@ -398,15 +419,16 @@ class AccountManager:
 
     def list_accounts(self) -> dict[str, dict[str, Any]]:
         """
-        List all configured accounts with status.
+        List all configured accounts with status using dynamic discovery.
 
         Returns:
             Dictionary mapping account names to their status info.
         """
         state = self.get_state()
         result = {}
+        available_ids = self._discover_account_ids()
 
-        for i in range(1, state.total_accounts + 1):
+        for i in available_ids:
             account_key = f"account{i}"
             creds_file = self.accounts_dir / f"oauth_creds_{i}.json"
             stats = state.accounts.get(account_key, AccountStats())
@@ -414,7 +436,7 @@ class AccountManager:
             result[account_key] = {
                 "index": i,
                 "active": i == state.current_index,
-                "exists": creds_file.exists(),
+                "exists": True,
                 "switches_count": stats.switches_count,
                 "last_used": stats.last_used,
             }
@@ -435,7 +457,7 @@ class AccountManager:
         most_used = max(
             accounts.items(),
             key=lambda x: x[1]["switches_count"],
-            default=("account1", {"switches_count": 0})
+            default=("none", {"switches_count": 0})
         )
 
         return {
@@ -456,15 +478,6 @@ def create_initial_state(
 ) -> RotationState:
     """
     Create initial state file for a new setup.
-
-    This should be called after setting up account credentials.
-
-    Args:
-        qwen_dir: Path to .qwen directory.
-        total_accounts: Total number of configured accounts.
-
-    Returns:
-        The created RotationState.
     """
     manager = AccountManager(qwen_dir=qwen_dir, total_accounts=total_accounts)
     state = RotationState(total_accounts=total_accounts)

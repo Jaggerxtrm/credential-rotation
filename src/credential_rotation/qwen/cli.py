@@ -4,13 +4,6 @@ account-qwen CLI - Qwen Account Rotation Management Utility
 
 This script manages multiple Qwen OAuth accounts with automatic
 round-robin rotation when quota is exhausted.
-
-Usage:
-    account-qwen --setup           Interactive setup for initial accounts
-    account-qwen --list            List all configured accounts
-    account-qwen --switch <index>  Manually switch to specific account
-    account-qwen --switch-next     Switch to next account (silent, for auto-rotation)
-    account-qwen --stats           Display usage statistics
 """
 
 from __future__ import annotations
@@ -28,9 +21,10 @@ from credential_rotation.qwen.manager import (
     AccountNotFoundError,
     LockError,
     SwitchReason,
+    create_initial_state,
 )
 
-# ANSI color codes
+# Colors for terminal output
 GREEN = "\033[92m"
 YELLOW = "\033[93m"
 RED = "\033[91m"
@@ -40,238 +34,219 @@ BOLD = "\033[1m"
 
 
 def print_success(msg: str) -> None:
-    """Print success message in green."""
     print(f"{GREEN}✓{RESET} {msg}")
 
 
 def print_warning(msg: str) -> None:
-    """Print warning message in yellow."""
     print(f"{YELLOW}⚠{RESET} {msg}")
 
 
 def print_error(msg: str) -> None:
-    """Print error message in red."""
     print(f"{RED}✗{RESET} {msg}")
 
 
 def print_info(msg: str) -> None:
-    """Print info message in blue."""
     print(f"{BLUE}ℹ{RESET} {msg}")
 
 
 def print_header(msg: str) -> None:
-    """Print header in bold."""
-    print(f"\n{BOLD}{msg}{RESET}\n")
+    print(f"\n{BOLD}{BLUE}=== {msg} ==={RESET}\n")
 
 
 def check_qwen_installed() -> bool:
-    """Check if qwen CLI is installed."""
+    """Check if qwen CLI is installed and available in PATH."""
     return shutil.which("qwen") is not None
 
 
 def get_qwen_creds_path() -> Path:
-    """Get the path to qwen OAuth credentials."""
+    """Get the default path for qwen credentials."""
     return DEFAULT_QWEN_DIR / "oauth_creds.json"
+
+
+def _setup_single_account(index: int, total_label: str = "") -> bool:
+    """
+    Setup a single account interactively.
+    
+    Args:
+        index: Account index.
+        total_label: Optional label for progress (e.g., "/5").
+        
+    Returns:
+        True if success, False otherwise.
+    """
+    print_header(f"Account {index}{total_label}")
+    creds_path = get_qwen_creds_path()
+    accounts_dir = DEFAULT_QWEN_DIR / "accounts"
+
+    print("To add or update a Qwen account:")
+    print(f"  1. Open a {BOLD}NEW terminal{RESET}")
+    print(f"  2. Run: {BOLD}qwen{RESET}")
+    print(f"  3. Complete the OAuth login in your browser")
+    print(f"  4. When you see the qwen prompt, close that terminal")
+    print(f"  5. Return here and press {BOLD}ENTER{RESET}\n")
+
+    input("Press ENTER when you have completed the OAuth login...")
+
+    # Verify credentials were created
+    if not creds_path.exists():
+        print_error(f"No credentials found at {creds_path}")
+        retry = input("Try again? (y/N): ").strip().lower()
+        if retry == "y":
+            return _setup_single_account(index, total_label)
+        return False
+
+    # Move credentials to accounts directory
+    target_creds = accounts_dir / f"oauth_creds_{index}.json"
+
+    if target_creds.exists():
+        sys.stdout.write(f"{YELLOW}⚠{RESET} Account {index} credentials already exist. Overwrite? (y/N): ")
+        sys.stdout.flush()
+        overwrite = input().strip().lower()
+        if overwrite != "y":
+            print_info(f"Skipping account {index}")
+            return True
+
+    shutil.move(str(creds_path), str(target_creds))
+    print_success(f"Saved credentials as: {target_creds}")
+
+    # Clean up any remaining oauth_creds.json (sometimes move doesn't clean up perfectly)
+    if creds_path.exists():
+        creds_path.unlink()
+        
+    return True
 
 
 def setup_accounts(total_accounts: int = DEFAULT_TOTAL_ACCOUNTS) -> int:
     """
-    Interactive setup for Qwen account credentials.
-
-    Guides the user through OAuth login for each account, storing
-    credentials in accounts/oauth_creds_N.json.
-
-    Args:
-        total_accounts: Number of accounts to set up.
-
-    Returns:
-        Exit code (0 for success, 1 for error).
+    Interactive setup for initial Qwen account credentials.
     """
     print_header(f"Qwen Account Rotation Setup ({total_accounts} accounts)")
     print_info("This will guide you through logging into multiple Qwen accounts.")
-    print_info("Each account requires a separate OAuth flow in your browser.\n")
 
-    # Check qwen CLI is installed
     if not check_qwen_installed():
         print_error("qwen CLI is not installed!")
         print("Install it with: npm install -g @qwen-code/qwen-code")
         return 1
 
-    # Create accounts directory
     qwen_dir = DEFAULT_QWEN_DIR
     accounts_dir = qwen_dir / "accounts"
 
     if not accounts_dir.exists():
-        accounts_dir.mkdir(parents=True)
+        accounts_dir.mkdir(parents=True, exist_ok=True)
         print_success(f"Created accounts directory: {accounts_dir}")
-    else:
-        print_info(f"Accounts directory exists: {accounts_dir}")
-
-    # Setup each account
-    creds_path = get_qwen_creds_path()
 
     for i in range(1, total_accounts + 1):
-        print_header(f"Account {i}/{total_accounts}")
-
-        print("To add a new Qwen account:")
-        print(f"  1. Open a {BOLD}NEW terminal{RESET}")
-        print(f"  2. Run: {BOLD}qwen{RESET}")
-        print(f"  3. Complete the OAuth login in your browser")
-        print(f"  4. When you see the qwen prompt, close that terminal")
-        print(f"  5. Return here and press {BOLD}ENTER{RESET}\n")
-
-        input("Press ENTER when you have completed the OAuth login...")
-
-        # Verify credentials were created
-        if not creds_path.exists():
-            print_error(f"No credentials found at {creds_path}")
-            retry = input("Try again? (y/N): ").strip().lower()
-            if retry == "y":
-                # Retry this account
-                i -= 1
-                continue
-            else:
-                return 1
-
-        # Move credentials to accounts directory
-        target_creds = accounts_dir / f"oauth_creds_{i}.json"
-
-        if target_creds.exists():
-            sys.stdout.write(f"{YELLOW}⚠{RESET} Account {i} credentials already exist. Overwrite? (y/N): ")
-            sys.stdout.flush()
-            overwrite = input().strip().lower()
-            if overwrite != "y":
-                print_info(f"Skipping account {i}")
-                continue
-
-        shutil.move(str(creds_path), str(target_creds))
-        print_success(f"Saved credentials as: {target_creds}")
-
-        # Clean up any remaining oauth_creds.json
-        if creds_path.exists():
-            creds_path.unlink()
-
-    # Create initial state
-    print_header("Creating Initial State")
-    AccountManager(total_accounts=total_accounts)
-
-    # Create symlink to first account
-    first_creds = accounts_dir / "oauth_creds_1.json"
-    creds_link = qwen_dir / "oauth_creds.json"
-
-    if creds_link.exists():
-        creds_link.unlink()
-
-    creds_link.symlink_to(first_creds)
-    print_success(f"Created symlink: {creds_link} → {first_creds}")
-
-    # Initialize state
-    from credential_rotation.qwen.manager import create_initial_state
-    create_initial_state(total_accounts=total_accounts)
-    print_success(f"Created state file with {total_accounts} accounts")
+        if not _setup_single_account(i, f"/{total_accounts}"):
+            return 1
 
     print_header("Setup Complete!")
-    print_success("All accounts configured successfully.")
-    print(f"\nYou can now use:")
-    print(f"  {BOLD}account-qwen --list{RESET}    - View all accounts")
-    print(f"  {BOLD}account-qwen --stats{RESET}   - View usage statistics")
+    print_info("Creating initial state...")
+    create_initial_state(total_accounts=total_accounts)
+    print_success("You can now use account-qwen to manage your accounts.")
+    return 0
 
+
+def add_account() -> int:
+    """Add a new account to the rotation."""
+    print_header("Add New Qwen Account")
+    
+    if not check_qwen_installed():
+        print_error("qwen CLI is not installed!")
+        return 1
+
+    manager = AccountManager()
+    existing_ids = manager._discover_account_ids()
+    
+    # Find the next ID
+    new_id = 1
+    while new_id in existing_ids:
+        new_id += 1
+        
+    print_info(f"Adding new account as index {new_id}")
+    if _setup_single_account(new_id):
+        print_success(f"Account {new_id} added successfully.")
+        return 0
+    return 1
+
+
+def remove_account(index: int) -> int:
+    """Remove an account from the rotation."""
+    manager = AccountManager()
+    target_creds = manager.accounts_dir / f"oauth_creds_{index}.json"
+    
+    if not target_creds.exists():
+        print_error(f"Account {index} not found at {target_creds}")
+        return 1
+        
+    print_warning(f"Are you sure you want to remove account {index}? (y/N): ")
+    confirm = input().strip().lower()
+    if confirm == "y":
+        target_creds.unlink()
+        print_success(f"Removed account {index}")
+        return 0
+    
+    print_info("Operation cancelled.")
     return 0
 
 
 def list_accounts() -> int:
-    """
-    List all configured accounts with their status.
-
-    Returns:
-        Exit code (0 for success, 1 for error).
-    """
+    """List all configured accounts and their status."""
     manager = AccountManager()
     accounts = manager.list_accounts()
 
-    print_header("Configured Qwen Accounts")
+    if not accounts:
+        print_warning("No accounts configured. Run 'account-qwen --setup' or '--add'")
+        return 0
 
-    for name, info in sorted(accounts.items()):
+    print_header("Qwen Accounts")
+    for index_str, info in accounts.items():
         index = info["index"]
-        active_marker = f"{GREEN}[ACTIVE]{RESET}" if info["active"] else "        "
+        active_marker = "*" if info["active"] else " "
         exists_marker = "✓" if info["exists"] else "✗"
-        switches = info["switches_count"]
-        last_used = info["last_used"] or "never"
+        name = f"Account {index}"
 
         print(f"  {active_marker} [{index}] {name} {exists_marker}")
-        print(f"                Switches: {switches}, Last used: {last_used}")
 
+    print(f"\n({BOLD}*{RESET} = active account, {GREEN}✓{RESET} = credentials exist)")
     return 0
 
 
-def switch_account(index: int | None) -> int:
-    """
-    Switch to a specific account by index.
-
-    Args:
-        index: Account index to switch to (1-based). If None, switches to next.
-
-    Returns:
-        Exit code (0 for success, 1 for error).
-    """
+def switch_account(index: int | None = None) -> int:
+    """Switch to specific or next account."""
     manager = AccountManager()
 
     try:
-        if index is not None:
-            # Switch to specific account
-            state = manager.get_state()
-
-            if index < 1 or index > state.total_accounts:
-                print_error(f"Invalid account index: {index}")
-                print(f"Valid range: 1-{state.total_accounts}")
-                return 1
-
-            prev = f"account{state.current_index}"
-            manager.switch_to(index, reason=SwitchReason.MANUAL)
-            print_success(f"Switched from {prev} to account{index}")
-            print(f"Updated symlink: oauth_creds.json → accounts/oauth_creds_{index}.json")
+        if index is None:
+            # Switch to next
+            success, new_index = manager.switch_next(reason=SwitchReason.MANUAL)
+            if not success:
+                print_warning(f"Cycled back to the first available account ({new_index})")
+            else:
+                print_success(f"Switched to account {new_index}")
         else:
-            # Switch to next account (silent mode for auto-rotation)
-            switched, next_index = manager.switch_next(reason=SwitchReason.AUTO_QUOTA)
-            if not switched:
-                print_warning("All accounts exhausted, cycled back to account1")
-            print_success(f"Switched to account{next_index}")
-
+            # Switch to specific
+            manager.switch_to(index)
+            print_success(f"Switched to account {index}")
         return 0
-
-    except AccountNotFoundError as e:
+    except (AccountNotFoundError, LockError, ValueError) as e:
         print_error(str(e))
-        return 1
-    except LockError as e:
-        print_error(f"Could not acquire lock: {e}")
-        return 1
-    except Exception as e:
-        print_error(f"Unexpected error: {e}")
         return 1
 
 
 def show_stats() -> int:
-    """
-    Display usage statistics.
-
-    Returns:
-        Exit code (0 for success).
-    """
+    """Show usage statistics."""
     manager = AccountManager()
     stats = manager.get_stats()
 
-    print_header("Account Usage Statistics")
+    print_header("Usage Statistics")
+    print(f"Total switches: {stats['total_switches']}")
+    print(f"Last switch:    {stats['last_switch'] or 'Never'}")
+    print(f"Current active: {stats['current_account']}")
+    print(f"Most used:      {stats['most_used_account']} ({stats['most_used_count']} times)")
 
-    # Per-account usage
-    print("Switches per account:")
-    for account, count in sorted(stats["accounts"].items()):
-        print(f"  {account}: {count}")
-
-    print()
-    print(f"  Total rotations: {stats['total_switches']}")
-    print(f"  Last rotation: {stats['last_switch'] or 'never'}")
-    print(f"  Current account: {GREEN}{stats['current_account']}{RESET}")
-    print(f"  Most used: {stats['most_used_account']} ({stats['most_used_count']} switches)")
+    print_header("Account Breakdown")
+    for account, count in stats["accounts"].items():
+        print(f"  {account}: {count} switches")
 
     return 0
 
@@ -284,11 +259,12 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=dedent("""
             Examples:
-              account-qwen --setup           Set up 5 accounts interactively
+              account-qwen --setup           Set up initial accounts
+              account-qwen --add             Add a new account to the rotation
+              account-qwen --remove 3        Remove account index 3
               account-qwen --list            List all accounts with status
               account-qwen --switch 3        Switch to account 3
               account-qwen --switch-next     Switch to next account (round-robin)
-              account-qwen --stats           Show usage statistics
         """),
     )
 
@@ -296,7 +272,18 @@ def main() -> int:
     group.add_argument(
         "--setup",
         action="store_true",
-        help="Interactive setup for initial account configuration",
+        help="Interactive setup for initial configuration",
+    )
+    group.add_argument(
+        "--add",
+        action="store_true",
+        help="Add a new account to the rotation",
+    )
+    group.add_argument(
+        "--remove",
+        metavar="INDEX",
+        type=int,
+        help="Remove a specific account by index",
     )
     group.add_argument(
         "--list",
@@ -312,7 +299,7 @@ def main() -> int:
     group.add_argument(
         "--switch-next",
         action="store_true",
-        help="Switch to next account in round-robin (silent, for auto-rotation)",
+        help="Switch to next available account (round-robin)",
     )
     group.add_argument(
         "--stats",
@@ -325,6 +312,10 @@ def main() -> int:
     # Route to appropriate handler
     if args.setup:
         return setup_accounts()
+    elif args.add:
+        return add_account()
+    elif args.remove is not None:
+        return remove_account(args.remove)
     elif args.list:
         return list_accounts()
     elif args.switch is not None:
