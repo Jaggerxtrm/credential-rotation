@@ -82,6 +82,12 @@ else:
 # List all accounts with status
 account-qwen --list
 
+# Add a new account
+account-qwen --add
+
+# Remove an account
+account-qwen --remove 3
+
 # Switch to specific account
 account-qwen --switch 3
 
