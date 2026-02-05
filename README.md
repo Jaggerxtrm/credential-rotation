@@ -16,18 +16,24 @@ This package provides automatic credential rotation for CLI tools that have usag
 
 ## Installation
 
-### From PyPI (when published)
+**Quick install from PyPI:**
 ```bash
 pip install credential-rotation
 ```
 
-### From GitHub
-```bash
-pip install git+https://github.com/dawid/credential-rotation.git
-```
+📖 **Detailed Installation Guide:** See [INSTALLATION.md](INSTALLATION.md) for:
+- All installation methods
+- Troubleshooting
+- Docker integration
+- Offline installation
+- Uninstallation and upgrades
 
-### Development Install
+**Other installation options:**
 ```bash
+# From GitHub
+pip install git+https://github.com/dawid/credential-rotation.git
+
+# Development install
 git clone https://github.com/dawid/credential-rotation.git
 cd credential-rotation
 pip install -e ".[dev,qwen]"
@@ -220,6 +226,15 @@ MIT License - see LICENSE file for details.
 ## Contributing
 
 Contributions welcome! Please read CONTRIBUTING.md for guidelines.
+
+## For Maintainers
+
+📖 **Publishing Guide:** See [PUBLISHING.md](PUBLISHING.md) for:
+- Version management
+- PyPI publishing workflow
+- GitHub releases
+- Continuous deployment setup
+- Troubleshooting
 
 ## Roadmap
 
