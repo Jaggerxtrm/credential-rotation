@@ -118,15 +118,23 @@ def _setup_single_account(index: int, total_label: str = "") -> bool:
 
 def setup_accounts(total_accounts: int = DEFAULT_TOTAL_ACCOUNTS) -> int:
     """
-    Interactive setup for initial Qwen account credentials.
+    Interactive setup for Qwen account credentials.
     """
-    print_header(f"Qwen Account Rotation Setup ({total_accounts} accounts)")
-    print_info("This will guide you through logging into multiple Qwen accounts.")
-
+    print_header("Qwen Account Rotation Setup")
+    
     if not check_qwen_installed():
         print_error("qwen CLI is not installed!")
         print("Install it with: npm install -g @qwen-code/qwen-code")
         return 1
+
+    # Chiediamo all'utente quanti account vuole
+    print_info(f"Default configuration is {DEFAULT_TOTAL_ACCOUNTS} accounts.")
+    try:
+        user_input = input(f"How many accounts would you like to configure? [{DEFAULT_TOTAL_ACCOUNTS}]: ").strip()
+        if user_input:
+            total_accounts = int(user_input)
+    except ValueError:
+        print_warning(f"Invalid input. Using default: {total_accounts}")
 
     qwen_dir = DEFAULT_QWEN_DIR
     accounts_dir = qwen_dir / "accounts"
@@ -137,11 +145,17 @@ def setup_accounts(total_accounts: int = DEFAULT_TOTAL_ACCOUNTS) -> int:
 
     for i in range(1, total_accounts + 1):
         if not _setup_single_account(i, f"/{total_accounts}"):
-            return 1
+            print_warning("\nSetup interrupted.")
+            break
+        
+        if i < total_accounts:
+            cont = input(f"\nAccount {i} configured. Continue to next? (Y/n): ").strip().lower()
+            if cont == "n":
+                break
 
-    print_header("Setup Complete!")
-    print_info("Creating initial state...")
-    create_initial_state(total_accounts=total_accounts)
+    print_header("Setup Process Finished")
+    print_info("Finalizing state...")
+    create_initial_state(total_accounts=i) # Usiamo il numero reale configurato
     print_success("You can now use account-qwen to manage your accounts.")
     return 0
 
