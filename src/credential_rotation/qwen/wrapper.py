@@ -112,7 +112,15 @@ class QwenWrapper:
         Returns:
             CompletedProcess result.
         """
-        cmd = ["qwen", prompt, "--output-format", "text"]
+        # Optimized command for non-interactive automation:
+        # - --auth-type qwen-oauth: Force use of rotated credentials
+        # - --yolo: Automatically accept all actions (aka YOLO mode)
+        cmd = [
+            "qwen", prompt, 
+            "--output-format", "text", 
+            "--auth-type", "qwen-oauth",
+            "--yolo"
+        ]
 
         try:
             result = subprocess.run(
@@ -124,12 +132,11 @@ class QwenWrapper:
             return result
         except subprocess.TimeoutExpired as e:
             logger.error(f"Qwen command timed out after {timeout}s")
-            # Return a fake error result
             return subprocess.CompletedProcess(
                 args=cmd,
                 returncode=-1,
                 stdout="",
-                stderr=f"Command timed out after {timeout} seconds",
+                stderr=f"Command timed out after {timeout} seconds.",
             )
         except FileNotFoundError:
             logger.error("qwen CLI not found. Is it installed?")

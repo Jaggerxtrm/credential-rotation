@@ -29,13 +29,12 @@ def ping_all_accounts():
             # Switch forzato
             manager.switch_to(i, reason=SwitchReason.TEST)
             
-            # Esecuzione comando Qwen (posizionale)
-            # Usiamo un timeout per sicurezza
+            # Esecuzione comando Qwen con flag YOLO
             result = subprocess.run(
-                ["qwen", "say hello in one word"], 
+                ["qwen", "say hello in one word", "--auth-type", "qwen-oauth", "--yolo"], 
                 capture_output=True,
                 text=True,
-                timeout=30
+                timeout=45
             )
             
             success = result.returncode == 0
@@ -51,6 +50,8 @@ def ping_all_accounts():
             else:
                 logger.error(f"❌ Account {i} fallito: {result.stderr.strip()[:100]}")
                 
+        except subprocess.TimeoutExpired:
+            report.append({"account": i, "success": False, "error": "Timeout (45s)"})
         except Exception as e:
             report.append({"account": i, "success": False, "error": str(e)})
             
