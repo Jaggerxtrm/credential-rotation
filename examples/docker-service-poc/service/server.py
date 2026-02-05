@@ -1,62 +1,74 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from credential_rotation.qwen.manager import AccountManager, SwitchReason
 from credential_rotation import QwenWrapper
 import logging
-import os
 import subprocess
-import threading
+import os
 
-# Configurazione logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qwen-service")
 
 app = FastAPI()
 wrapper = QwenWrapper(max_retries=3)
 
-def validate_accounts():
+@app.get("/ping-all")
+def ping_all_accounts():
     """
-    Validate that all discovered accounts are actually usable.
-    Run in background to avoid blocking startup.
+    Testa ogni account configurato eseguendo un comando reale.
     """
-    logger.info("--- AVVIO VALIDAZIONE BACKGROUND ---")
-    try:
-        manager = AccountManager()
-        ids = manager._discover_account_ids()
-        
-        if not ids:
-            logger.warning("❌ Nessun account trovato.")
-            return
-
-        for i in ids:
-            try:
-                # Non facciamo switch reale per non disturbare il servizio
-                # Eseguiamo solo un check informativo se possibile
-                pass 
-            except Exception as e:
-                logger.error(f"Errore check account {i}: {e}")
+    manager = AccountManager()
+    ids = manager._discover_account_ids()
+    report = []
+    
+    logger.info(f"Avvio ping test per {len(ids)} account...")
+    
+    for i in ids:
+        logger.info(f"Testando Account {i}...")
+        try:
+            # Switch forzato
+            manager.switch_to(i, reason=SwitchReason.TEST)
+            
+            # Esecuzione comando Qwen (posizionale)
+            # Usiamo un timeout per sicurezza
+            result = subprocess.run(
+                ["qwen", "say hello in one word"], 
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            success = result.returncode == 0
+            report.append({
+                "account": i,
+                "success": success,
+                "output": result.stdout.strip() if success else None,
+                "error": result.stderr.strip() if not success else None
+            })
+            
+            if success:
+                logger.info(f"✅ Account {i} funzionante: {result.stdout.strip()}")
+            else:
+                logger.error(f"❌ Account {i} fallito: {result.stderr.strip()[:100]}")
                 
-        logger.info(f"Rilevati {len(ids)} account pronti.")
-    except Exception as e:
-        logger.error(f"Errore validazione: {e}")
-
-# Avvia check in background
-threading.Thread(target=validate_accounts, daemon=True).start()
-
-class PromptRequest(BaseModel):
-    prompt: str
+        except Exception as e:
+            report.append({"account": i, "success": False, "error": str(e)})
+            
+    return {"total": len(ids), "results": report}
 
 @app.post("/generate")
-def generate(req: PromptRequest):
-    logger.info(f"Received prompt: {req.prompt[:50]}...")
-    result = wrapper.call(req.prompt)
+def generate(req: dict):
+    # Endpoint standard per l'uso normale
+    prompt = req.get("prompt", "hello")
+    result = wrapper.call(prompt)
     return {
         "success": result.success,
         "output": result.output,
-        "attempts": result.attempts,
-        "error": result.error
+        "attempts": result.attempts
     }
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "wrapper_ready": True}
+    manager = AccountManager()
+    state = manager.get_state()
+    return {"status": "ok", "current_account": state.current_index}
