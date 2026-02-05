@@ -1,0 +1,27 @@
+
+services:
+  # IL SERVER CENTRALIZZATO
+  # Contiene: Node.js, Qwen CLI, Python, Credential Rotation Lib
+  qwen-service:
+    build:
+      context: ../../  # Root del progetto
+      dockerfile: examples/docker-service-poc/service/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      # BIND-MOUNT CRITICO:
+      # Aggiunto :Z per compatibilità SELinux con Podman
+      - ${HOME}/.qwen:/root/.qwen:rw,Z
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  # IL CLIENTE (Simulazione)
+  # Contiene: Solo Python e Requests (Niente Node/Qwen!)
+  client-app:
+    build:
+      context: ../../
+      dockerfile: examples/docker-service-poc/client/Dockerfile
+    depends_on:
+      - qwen-service
+    environment:
+      - PYTHONUNBUFFERED=1
