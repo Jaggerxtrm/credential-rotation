@@ -10,9 +10,11 @@
 - **Persistence:** Maintains state in `~/.qwen/state.yaml`.
 
 ## Architecture
-The system operates by managing a symlink at `~/.qwen/oauth_creds.json` that points to the currently active account file in `~/.qwen/accounts/`.
+The system operates by managing physical file swapping in `~/.qwen/oauth_creds.json`. This replaces the previous symlink approach to ensure compatibility with the Qwen CLI's write behavior.
 
-- **`AccountManager`**: Core logic for listing, switching, and locking accounts.
+- **`AccountManager`**: Core logic for listing, switching, and **Sync-Back** operations.
+  - **Sync-Back:** Before switching, the current `oauth_creds.json` is saved back to its slot (e.g., `accounts/oauth_creds_1.json`) to capture any token refreshes.
+  - **Swap:** The new account file is physically copied to `oauth_creds.json`.
 - **`QwenWrapper`**: Wraps CLI execution to catch errors and trigger rotation.
 
 ## Setup & Installation
